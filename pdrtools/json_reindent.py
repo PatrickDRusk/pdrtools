@@ -25,7 +25,6 @@ def __main():
     json_fname = args['<file>']
 
     indent = int(args['--indent'])
-    print indent
 
     json_reindent(json_fname, indent)
 
