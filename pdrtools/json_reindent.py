@@ -1,17 +1,15 @@
 #! /usr/bin/env python
 
 """
-json_indent.py re-indents files containing json with a new indentation level.
+json_reindent.py re-indents files containing json with a new indentation level.
 
 Usage:
-  json_indent.py <file> [--indent=<indent>]
+  json_reindent.py <file> [--indent=<indent>]
 
 Options:
   --indent INDENT       The number of spaces in the indent [default: 2]
 """
 
-import os
-import logging
 import json
 
 from envopt import envopt
