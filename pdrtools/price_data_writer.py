@@ -20,11 +20,11 @@ from price_data import storage as price
 current_millis = lambda: int(round(time.time() * 1000))
 
 BUCKET = None
-PREFIX = 'pdr/blobz4'
+PREFIX = 'pdr/blobz5'
 
 CONTRACT_PRICES_IN_SECURITY = 150
 
-DO_WRITES = True
+DO_WRITES = False
 WRITE_CONTRACT_DATA = False
 FAKE_SECURITY_CONTRACT = "0000"
 
@@ -87,6 +87,10 @@ BAD_CONTRACTS = {
     "AAQ00_COMDTY",
 }
 
+INTRADAY_COMDTYS = {'CL_COMDTY', 'CO_COMDTY', 'XB_COMDTY', 'HO_COMDTY', 'HG_COMDTY', 'SB_COMDTY'}
+
+CONTRACT_MAP = dict()
+
 
 def write_blob(sec_name, contract_name, category, blob_name, data):
     path = os.path.join(*filter(None, [PREFIX, sec_name, category, contract_name, blob_name]))
@@ -111,6 +115,19 @@ def write_df(sec_name, contract_name, category, blob_name, df):
     write_blob(sec_name, contract_name, category, blob_name, df_dict)
 
 
+def write_col(sec_name, contract_name, category, blob_name, df):
+    storage = price.PriceDataStorage(blob_name, sec_name)
+    df = df.copy().reset_index().set_index(['log_s'])
+    for name, series in df['value'].groupby(df['contract']):
+        first_date = series.index[0].to_timestamp().to_datetime().date()
+        cindex = pandas.period_range(series.index[0], series.index[-1], freq='D')
+        values = series.asfreq('D').reindex(cindex).values.tolist()
+        values = [None if numpy.isnan(f) else f for f in values]
+        storage.add(name, first_date, values)
+    df_dict = storage.to_dict()
+    write_blob(sec_name, contract_name, category, blob_name, df_dict)
+
+
 def write_df_and_columns(sec_name, contract_name, category, df, columns):
     # obs_keys = df.index.to_timestamp() + (6 * offsets.Hour())
     # op_keys = obs_keys + offsets.Hour()
@@ -118,13 +135,13 @@ def write_df_and_columns(sec_name, contract_name, category, df, columns):
     # df.insert(0, 'obs', obs_keys)
     # df.insert(1, 'op', op_keys)
 
-    write_df(sec_name, contract_name, category, 'all', df)
+    #write_df(sec_name, contract_name, category, 'all', df)
 
     for col in columns:
         new_df = df.copy().loc[:, (col,)]
         new_df.columns = ['value']
         new_df = new_df[~numpy.isnan(new_df.value)]
-        write_df(sec_name, contract_name, category, col, new_df)
+        write_col(sec_name, contract_name, category, col, new_df)
 
 
 def write_contract(sec_name, contract_name, category, inception, expiry, close, volume):
@@ -163,12 +180,12 @@ def write_contract(sec_name, contract_name, category, inception, expiry, close, 
 def write_security(sec_name, df, category, columns):
     df = df.reset_index()
     df = df.set_index(['contract', 'log_s'])
-    write_df(sec_name, FAKE_SECURITY_CONTRACT, category, 'all', df)
+    # write_df(sec_name, FAKE_SECURITY_CONTRACT, category, 'all', df)
     for col in columns:
         new_df = df.copy().loc[:, (col,)]
         new_df.columns = ['value']
         new_df = new_df[~numpy.isnan(new_df.value)]
-        write_df(sec_name, FAKE_SECURITY_CONTRACT, category, col, new_df)
+        write_col(sec_name, FAKE_SECURITY_CONTRACT, category, col, new_df)
 
     # df.to_csv('spaz.csv')
 
@@ -204,6 +221,8 @@ def process_symbol(sec_name):
     for contract_name in df.index:
         if contract_name in BAD_CONTRACTS:
             continue
+
+        CONTRACT_MAP[contract_name] = sec_name
 
         inception = df.loc[contract_name, 'inception']
         expiry = df.loc[contract_name, 'expiration']
@@ -258,6 +277,10 @@ def __main():
 
     for sec_name in COMDTYS:
         process_symbol(sec_name)
+
+    global DO_WRITES
+    DO_WRITES = True
+    write_blob(None, None, None, 'contract_map', CONTRACT_MAP)
 
     log_millis(millis, "Time to run: ")
 
