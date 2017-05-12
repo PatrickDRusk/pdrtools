@@ -26,7 +26,7 @@ PREFIX = 'pdr/blobz5'
 
 BDAYS_PER_CONTRACT = 150
 
-DO_WRITES = False
+DO_WRITES = True
 WRITE_CONTRACT_DATA = False
 FAKE_SECURITY_CONTRACT = "0000"
 
@@ -90,99 +90,32 @@ BAD_CONTRACTS = {
 }
 
 INTRADAY_COMDTYS = {'CL_COMDTY', 'CO_COMDTY', 'XB_COMDTY', 'HO_COMDTY', 'HG_COMDTY', 'SB_COMDTY'}
-INTRADAY_MINS = (15,120)
+INTRADAY_MINS = (15, 120)
 
 CONTRACT_MAP = dict()
 
 
-def write_blob(sec_name, contract_name, category, blob_name, data):
-    path = os.path.join(*filter(None, [PREFIX, sec_name, category, contract_name, blob_name]))
-    if DO_WRITES:
-        print(path)
-        pstr = cPickle.dumps(data, -1)
-        BUCKET.put_object(Key=path, Body=pstr)
-    else:
-        print("Skipping blob write")
-        # print data
+def __main():
+    millis = current_millis()
+
+    global BUCKET
+    s3 = boto3.resource('s3')
+    BUCKET = s3.Bucket('cm-engineers')
+
+    for sec_name in COMDTYS:
+        process_symbol(sec_name)
+
+    global DO_WRITES
+    DO_WRITES = True
+    write_blob(None, None, None, 'contract_map', CONTRACT_MAP)
+
+    log_millis(millis, "Time to run: ")
 
 
-def write_df(sec_name, contract_name, category, blob_name, df):
-    df = df.copy().reset_index()
-    # Convert log_s to a column of POSIX timestamp integers
-    # noinspection PyUnresolvedReferences
-    df.log_s = [int(time.mktime(p.to_timestamp().to_datetime().timetuple())) for p in df.log_s]
-    column_names = tuple(df.columns)
-    column_data = list()
-    for col_name in column_names:
-        column_data.append(df.loc[:, col_name].values)
-    df_dict = dict(names=column_names, data=column_data)
-    write_blob(sec_name, contract_name, category, blob_name, df_dict)
-
-
-def write_col(sec_name, contract_name, category, blob_name, df):
-    storage = price.PriceDataStorage(blob_name, sec_name)
-    df = df.copy().reset_index().set_index(['log_s'])
-    for name, series in df['value'].groupby(df['contract']):
-        first_date = series.index[0].to_timestamp().to_datetime().date()
-        cindex = pandas.period_range(series.index[0], series.index[-1], freq='D')
-        values = series.asfreq('D').reindex(cindex).values.tolist()
-        values = [None if numpy.isnan(f) else f for f in values]
-        storage.add(name, first_date, values)
-    df_dict = storage.to_dict()
-    write_blob(sec_name, contract_name, category, blob_name, df_dict)
-
-
-def write_df_and_columns(sec_name, contract_name, category, df, columns):
-    # obs_keys = df.index.to_timestamp() + (6 * offsets.Hour())
-    # op_keys = obs_keys + offsets.Hour()
-
-    # df.insert(0, 'obs', obs_keys)
-    # df.insert(1, 'op', op_keys)
-
-    # write_df(sec_name, contract_name, category, 'all', df)
-
-    for col in columns:
-        new_df = df.copy().loc[:, (col,)]
-        new_df.columns = ['value']
-        new_df = new_df[~numpy.isnan(new_df.value)]
-        write_col(sec_name, contract_name, category, col, new_df)
-
-
-def write_contract(sec_name, contract_name, category, expiry, close):
-    if (expiry is None) or (isinstance(expiry, numbers.Number) and numpy.isnan(expiry)):
-        raise ValueError("%s has no expiration date" % contract_name)
-
-    contract_df = pandas.DataFrame.from_dict(
-        OrderedDict((
-            ('contract', contract_name),
-            ('close', close),
-            )
-        )
-    )
-    contract_df.index.name = 'log_s'
-
-    # Check for zeroes
-    zeroes_df = contract_df[contract_df.close == 0.0]
-    if len(zeroes_df):
-        print "%s has %d zero prices; removing them" % (contract_name, len(zeroes_df))
-        contract_df = contract_df[~(contract_df.close == 0.0)]
-
-    if WRITE_CONTRACT_DATA:
-        print "Writing contract data for %s" % contract_name
-        write_df_and_columns(sec_name, contract_name, category, contract_df, ('close',))
-
-    return contract_df
-
-
-def write_security(sec_name, df, category, columns):
-    df = df.reset_index()
-    df = df.set_index(['contract', 'log_s'])
-    # write_df(sec_name, FAKE_SECURITY_CONTRACT, category, 'all', df)
-    for col in columns:
-        new_df = df.copy().loc[:, (col,)]
-        new_df.columns = ['value']
-        new_df = new_df[~numpy.isnan(new_df.value)]
-        write_col(sec_name, FAKE_SECURITY_CONTRACT, category, col, new_df)
+def log_millis(millis, pattern):
+    delta = current_millis() - millis
+    print(pattern + str(delta))
+    return current_millis()
 
 
 def process_symbol(sec_name):
@@ -213,7 +146,8 @@ def process_symbol(sec_name):
     df.index.name = 'contract'
 
     # Iterate over the contracts looking for bad prices
-    all_df = None
+    all_close_df = None
+    all_vwap_df = [None]*len(INTRADAY_MINS)
     for contract_name in df.index:
         if contract_name in BAD_CONTRACTS:
             continue
@@ -236,40 +170,100 @@ def process_symbol(sec_name):
         try:
             close = iseries.daily_close(icontract.factory(contract_name), cindex, currency='USD').dropna()
             if len(close):
-                contract_df = write_contract(sec_name, contract_name, "DAILY", expiry, close)
-                if all_df is None:
-                    all_df = contract_df
+                close_df = write_contract(sec_name, contract_name, "DAILY", expiry, close)
+                if all_close_df is None:
+                    all_close_df = close_df
                 else:
-                    all_df = pandas.concat([all_df, contract_df])
+                    all_close_df = pandas.concat([all_close_df, close_df])
         except Exception as exc:
             print exc
 
-    if all_df is not None:
+
+    if all_close_df is not None:
         # noinspection PyTypeChecker
-        write_security(sec_name, all_df, "DAILY", ('close',))
+        write_security(sec_name, all_close_df, "DAILY", ('close',))
 
 
-def log_millis(millis, pattern):
-    delta = current_millis() - millis
-    print(pattern + str(delta))
-    return current_millis()
+def write_security(sec_name, df, category, columns):
+    df = df.reset_index()
+    df = df.set_index(['contract', 'log_s'])
+    for col in columns:
+        new_df = df.copy().loc[:, (col,)]
+        new_df.columns = ['value']
+        new_df = new_df[~numpy.isnan(new_df.value)]
+        write_col(sec_name, FAKE_SECURITY_CONTRACT, category, col, new_df)
 
 
-def __main():
-    millis = current_millis()
+def write_contract(sec_name, contract_name, category, expiry, close):
+    if (expiry is None) or (isinstance(expiry, numbers.Number) and numpy.isnan(expiry)):
+        raise ValueError("%s has no expiration date" % contract_name)
 
-    global BUCKET
-    s3 = boto3.resource('s3')
-    BUCKET = s3.Bucket('cm-engineers')
+    contract_df = pandas.DataFrame.from_dict(
+        OrderedDict((
+            ('contract', contract_name),
+            ('close', close),
+            )
+        )
+    )
+    contract_df.index.name = 'log_s'
 
-    for sec_name in COMDTYS:
-        process_symbol(sec_name)
+    # Check for zeroes
+    zeroes_df = contract_df[contract_df.close == 0.0]
+    if len(zeroes_df):
+        # print "%s has %d zero prices; removing them" % (contract_name, len(zeroes_df))
+        contract_df = contract_df[~(contract_df.close == 0.0)]
 
-    global DO_WRITES
-    DO_WRITES = True
-    write_blob(None, None, None, 'contract_map', CONTRACT_MAP)
+    if WRITE_CONTRACT_DATA:
+        print "Writing contract data for %s" % contract_name
+        write_df_and_columns(sec_name, contract_name, category, contract_df, ('close',))
 
-    log_millis(millis, "Time to run: ")
+    return contract_df
+
+
+def write_df_and_columns(sec_name, contract_name, category, df, columns):
+    # write_df(sec_name, contract_name, category, 'all', df)
+
+    for col in columns:
+        new_df = df.copy().loc[:, (col,)]
+        new_df.columns = ['value']
+        new_df = new_df[~numpy.isnan(new_df.value)]
+        write_col(sec_name, contract_name, category, col, new_df)
+
+
+def write_df(sec_name, contract_name, category, blob_name, df):
+    df = df.copy().reset_index()
+    # Convert log_s to a column of POSIX timestamp integers
+    # noinspection PyUnresolvedReferences
+    df.log_s = [int(time.mktime(p.to_timestamp().to_datetime().timetuple())) for p in df.log_s]
+    column_names = tuple(df.columns)
+    column_data = list()
+    for col_name in column_names:
+        column_data.append(df.loc[:, col_name].values)
+    df_dict = dict(names=column_names, data=column_data)
+    write_blob(sec_name, contract_name, category, blob_name, df_dict)
+
+
+def write_col(sec_name, contract_name, category, blob_name, df):
+    storage = price.PriceDataStorage(blob_name, sec_name)
+    df = df.copy().reset_index().set_index(['log_s'])
+    for name, series in df['value'].groupby(df['contract']):
+        first_date = series.index[0].to_timestamp().to_datetime().date()
+        cindex = pandas.period_range(series.index[0], series.index[-1], freq='D')
+        values = series.asfreq('D').reindex(cindex).values.tolist()
+        values = [None if numpy.isnan(f) else f for f in values]
+        storage.add(name, first_date, values)
+    df_dict = storage.to_dict()
+    write_blob(sec_name, contract_name, category, blob_name, df_dict)
+
+
+def write_blob(sec_name, contract_name, category, blob_name, data):
+    path = os.path.join(*filter(None, [PREFIX, sec_name, category, contract_name, blob_name]))
+    if DO_WRITES:
+        print(path)
+        pstr = cPickle.dumps(data, -1)
+        BUCKET.put_object(Key=path, Body=pstr)
+    else:
+        print("Skipping blob write")
 
 
 if __name__ == '__main__':
