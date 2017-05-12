@@ -12,7 +12,9 @@ import numpy
 import pandas
 from pandas.tseries import offsets
 
-from instrumentz import contract, security, series
+from instrumentz import contract as icontract
+from instrumentz import security as isecurity
+from instrumentz import series as iseries
 from pandaux import indaux
 
 from price_data import storage as price
@@ -22,7 +24,7 @@ current_millis = lambda: int(round(time.time() * 1000))
 BUCKET = None
 PREFIX = 'pdr/blobz5'
 
-CONTRACT_PRICES_IN_SECURITY = 150
+BDAYS_PER_CONTRACT = 150
 
 DO_WRITES = False
 WRITE_CONTRACT_DATA = False
@@ -88,6 +90,7 @@ BAD_CONTRACTS = {
 }
 
 INTRADAY_COMDTYS = {'CL_COMDTY', 'CO_COMDTY', 'XB_COMDTY', 'HO_COMDTY', 'HG_COMDTY', 'SB_COMDTY'}
+INTRADAY_MINS = (15,120)
 
 CONTRACT_MAP = dict()
 
@@ -106,6 +109,7 @@ def write_blob(sec_name, contract_name, category, blob_name, data):
 def write_df(sec_name, contract_name, category, blob_name, df):
     df = df.copy().reset_index()
     # Convert log_s to a column of POSIX timestamp integers
+    # noinspection PyUnresolvedReferences
     df.log_s = [int(time.mktime(p.to_timestamp().to_datetime().timetuple())) for p in df.log_s]
     column_names = tuple(df.columns)
     column_data = list()
@@ -135,7 +139,7 @@ def write_df_and_columns(sec_name, contract_name, category, df, columns):
     # df.insert(0, 'obs', obs_keys)
     # df.insert(1, 'op', op_keys)
 
-    #write_df(sec_name, contract_name, category, 'all', df)
+    # write_df(sec_name, contract_name, category, 'all', df)
 
     for col in columns:
         new_df = df.copy().loc[:, (col,)]
@@ -144,18 +148,14 @@ def write_df_and_columns(sec_name, contract_name, category, df, columns):
         write_col(sec_name, contract_name, category, col, new_df)
 
 
-def write_contract(sec_name, contract_name, category, inception, expiry, close, volume):
+def write_contract(sec_name, contract_name, category, expiry, close):
     if (expiry is None) or (isinstance(expiry, numbers.Number) and numpy.isnan(expiry)):
         raise ValueError("%s has no expiration date" % contract_name)
-    if (inception is None) or (isinstance(inception, numbers.Number) and numpy.isnan(inception)):
-        #raise ValueError("%s has no inception date" % contract_name)
-        print("%s has no inception date" % contract_name)
 
     contract_df = pandas.DataFrame.from_dict(
         OrderedDict((
             ('contract', contract_name),
             ('close', close),
-            ('volume', volume),
             )
         )
     )
@@ -164,15 +164,12 @@ def write_contract(sec_name, contract_name, category, inception, expiry, close, 
     # Check for zeroes
     zeroes_df = contract_df[contract_df.close == 0.0]
     if len(zeroes_df):
-        vols_df = zeroes_df[zeroes_df.Volume > 0.0]
-        print "%s has %d zero prices, %d with positive volumes" % (contract_name, len(zeroes_df), len(vols_df))
+        print "%s has %d zero prices; removing them" % (contract_name, len(zeroes_df))
         contract_df = contract_df[~(contract_df.close == 0.0)]
 
     if WRITE_CONTRACT_DATA:
         print "Writing contract data for %s" % contract_name
-        write_df_and_columns(sec_name, contract_name, category, contract_df, ('close', 'volume'))
-    else:
-        print '.', # contract_name,
+        write_df_and_columns(sec_name, contract_name, category, contract_df, ('close',))
 
     return contract_df
 
@@ -187,11 +184,10 @@ def write_security(sec_name, df, category, columns):
         new_df = new_df[~numpy.isnan(new_df.value)]
         write_col(sec_name, FAKE_SECURITY_CONTRACT, category, col, new_df)
 
-    # df.to_csv('spaz.csv')
-
 
 def process_symbol(sec_name):
-    instrument = security.factory(sec_name)
+    print("Processing %s" % sec_name)
+    instrument = isecurity.factory(sec_name)
 
     md_dict = dict()
     for key in instrument.metadata.keys():
@@ -204,17 +200,17 @@ def process_symbol(sec_name):
     df = df.to_frame('expiration')
 
     # Add a column for the inception dates
-    try:
-        contract_inception = pandas.Series(md_dict['inception_map'])
+    # NOTE: Keeping this in case we want to write all contract pricess as separate blobs in the future
+    inceptions = md_dict.get('inception_map', None)
+    if inceptions is not None:
+        contract_inception = pandas.Series(inceptions)
         contract_inception = contract_inception.map(lambda x: pandas.Period(x, freq="B"))
         df.loc[:, 'inception'] = contract_inception
-        df.insert(0, 'security', sec_name)
-        df.index.name = 'contract'
-    except KeyError as exc:
-        print "%s has no inception map" % sec_name
-        raise exc
+    else:
+        df.loc[:, 'inception'] = None
 
-    # df.to_csv('metadata.csv')
+    df.insert(0, 'security', sec_name)
+    df.index.name = 'contract'
 
     # Iterate over the contracts looking for bad prices
     all_df = None
@@ -231,35 +227,26 @@ def process_symbol(sec_name):
         if end <= DEEP_PAST:
             continue
 
-        if inception:
-            try:
-                start = indaux.apply_offset(inception, -offsets.BDay())
-            except:
-                start = DEEP_PAST
-        else:
-            start = DEEP_PAST
+        # NOTE: Use inception - 1 BDay if wanting to store all contract data in the future
+        start = indaux.apply_offset(inception, -BDAYS_PER_CONTRACT * offsets.BDay())
 
         cindex = pandas.period_range(start=start, end=end, freq='B')
 
-        # If there is any close or volume data, construct a dataframe with those rows
+        # If there is any close data, construct a dataframe with those rows
         try:
-            close = series.daily_close(contract.factory(contract_name), cindex, currency='USD').dropna()
-            volume = series.daily_volume(contract.factory(contract_name), cindex).dropna()
-            if len(close) or len(volume):
-                foo = write_contract(sec_name, contract_name, "DAILY", inception, expiry, close, volume)
-                foo = foo.iloc[-CONTRACT_PRICES_IN_SECURITY:, :]
+            close = iseries.daily_close(icontract.factory(contract_name), cindex, currency='USD').dropna()
+            if len(close):
+                contract_df = write_contract(sec_name, contract_name, "DAILY", expiry, close)
                 if all_df is None:
-                    all_df = foo
+                    all_df = contract_df
                 else:
-                    all_df = pandas.concat([all_df, foo])
+                    all_df = pandas.concat([all_df, contract_df])
         except Exception as exc:
             print exc
 
-    print
-
     if all_df is not None:
         # noinspection PyTypeChecker
-        write_security(sec_name, all_df, "DAILY", ('close', 'volume'))
+        write_security(sec_name, all_df, "DAILY", ('close',))
 
 
 def log_millis(millis, pattern):
