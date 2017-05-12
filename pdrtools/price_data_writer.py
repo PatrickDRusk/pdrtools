@@ -243,7 +243,7 @@ def process_symbol(sec_name):
 
         # If there is any close or volume data, construct a dataframe with those rows
         try:
-            close = series.daily_close(contract.factory(contract_name), cindex).dropna()
+            close = series.daily_close(contract.factory(contract_name), cindex, currency='USD').dropna()
             volume = series.daily_volume(contract.factory(contract_name), cindex).dropna()
             if len(close) or len(volume):
                 foo = write_contract(sec_name, contract_name, "DAILY", inception, expiry, close, volume)
