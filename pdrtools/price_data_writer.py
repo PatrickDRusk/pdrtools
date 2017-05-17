@@ -20,22 +20,21 @@ from instrumentz import series as iseries
 from pandaux import indaux
 
 from price_data import storage as price
-from yamm import stats
 
 current_millis = lambda: int(round(time.time() * 1000))
 
 BUCKET = None
-PREFIX = 'pdr/blobz'
+PREFIX = 'pdr/blobz3'
 
 BDAYS_PER_CONTRACT = 150
 
-DO_WRITES = True
+DO_WRITES = False
 DO_DAILY = False
 DO_INTRADAY = True
 
-SHORT_TEST = False
+SHORT_TEST = True
 
-BACKTEST_START = '2017-04-10' if SHORT_TEST else '1990-01-06'
+BACKTEST_START = '2017-04-02' if SHORT_TEST else '1990-01-06'
 BACKTEST_END = str(datetime.date.today())
 BACKTEST_INDEX = pandas.period_range(start=BACKTEST_START, end=BACKTEST_END, freq='B')
 DEEP_PAST = BACKTEST_INDEX[0]
@@ -43,8 +42,8 @@ DEEP_PAST = BACKTEST_INDEX[0]
 MINS_IN_DAY = 24 * 60
 
 COMDTYS = (
-    "AA_COMDTY",
     "CL_COMDTY",
+    "AA_COMDTY",
     "CO_COMDTY",
     "CU_COMDTY",
     "HG_COMDTY",
@@ -163,6 +162,7 @@ def group_name(mins):
 
 def process_symbol(sec_name):
     print("Processing %s" % sec_name)
+    millis = current_millis()
     instrument = isecurity.factory(sec_name)
 
     md_dict = dict()
@@ -186,72 +186,105 @@ def process_symbol(sec_name):
     else:
         df.loc[:, 'inception'] = None
 
-    # This will hold the entirety of VWAP data, if needed
-    all_vwaps_df = None
-    wap_dfs_list = None
-    if DO_INTRADAY and (sec_name in INTRADAY_COMDTYS):
-        def _convert_to_mins(p):
-            tup = p.timetuple()
-            return (tup.tm_hour * 60) + tup.tm_min
-
-        millis = current_millis()
-        all_minutes = pandas.period_range(BACKTEST_START, BACKTEST_END, freq="min")
-        all_vwaps_df = instrument.get_vwap_data_df(all_minutes, columns=['symbol', 'value', 'volume'])
-        all_vwaps_df.columns = ['contract', 'value', 'volume']
-        millis = log_millis(millis, "Time to read all VWAP data: ")
-
-        # Add columns for the number of minutes into each day, and the date with no time component
-        all_vwaps_df.loc[:, 'mins'] = [_convert_to_mins(p) for p in all_vwaps_df.index]
-        all_vwaps_df.loc[:, 'log_s'] = [dt.date() for dt in all_vwaps_df.index]
-        for mins in INTRADAY_MIN_SPECS:
-            grp_name = group_name(mins)
-            all_vwaps_df.loc[:, grp_name] = all_vwaps_df.mins // mins
-
-        all_vwaps_df = all_vwaps_df.reset_index()
-        all_vwaps_df.drop('date', axis=1, inplace=True)
-        all_vwaps_df.set_index(['contract', 'log_s', 'mins'], inplace=True)
-        millis = log_millis(millis, "Time to massage VWAP data: ")
-
-        # This will end up as a list of length INTRADAY_MIN_SPECS, of lists with lengths determined by the granularity
-        # of the WAP calculations, of dataframes having all of the security's WAPs for one daily time slot.  Phew!
-        wap_dfs_list = create_wap_dfs_list(INTRADAY_MIN_SPECS)
-
-    # This will hold multiple contracts' close prices, to be concatenated later
-    close_dfs = list()
-
-    # Gather the security's data one contract at a time, appending to those variables above
+    # Gather start/end stats for all relevant contracts
+    contracts_info = OrderedDict()
     for contract_name in df.index:
         if contract_name in BAD_CONTRACTS:
             continue
 
         CONTRACT_MAP[contract_name] = sec_name
 
-        inception = df.loc[contract_name, 'inception']
         expiry = df.loc[contract_name, 'expiration']
 
-        end = indaux.apply_offset(expiry, offsets.BDay())
-        if end <= DEEP_PAST:
+        end_p = indaux.apply_offset(expiry, offsets.BDay())
+        if end_p <= DEEP_PAST:
             continue
 
         # NOTE: Use inception - 1 BDay if wanting to store all contract data in the future.
+        # inception = df.loc[contract_name, 'inception']
         # For now, we're just storing the last BDAYS_PER_CONTRACT business days of prices.
-        start = indaux.apply_offset(expiry, -BDAYS_PER_CONTRACT * offsets.BDay())
+        start_p = max(indaux.apply_offset(expiry, -BDAYS_PER_CONTRACT * offsets.BDay()), DEEP_PAST)
 
+        # Convert to naive datetimes (for efficient use elsewhere)
+        start_dt = start_p.to_timestamp().to_datetime()
+        end_dt = end_p.to_timestamp().to_datetime()
+        contracts_info[contract_name] = (start_p, end_p, start_dt, end_dt)
+
+    millis = log_millis(millis, "setup: ")
+
+    if DO_INTRADAY and (sec_name in INTRADAY_COMDTYS):
+        write_all_intraday_data(sec_name, contracts_info)
+        millis = log_millis(millis, "intraday: ")
+
+    # This will hold multiple contracts' close prices, to be concatenated later
+    close_dfs = list()
+
+    # Gather the security's data one contract at a time, appending to those variables above
+    for contract_name, (__, __, start_dt, end_dt) in contracts_info.iteritems():
         if DO_DAILY:
-            contract_close_df = get_close_prices(contract_name, start, end)
+            contract_close_df = get_close_prices(contract_name, start_dt, end_dt)
             if contract_close_df is not None:
                 close_dfs.append(contract_close_df)
-
-        if DO_INTRADAY and (sec_name in INTRADAY_COMDTYS):
-            get_intraday_prices(all_vwaps_df, contract_name, start, end, wap_dfs_list)
 
     if DO_DAILY and (len(close_dfs) > 0):
         security_close_df = pandas.concat(close_dfs)
         # noinspection PyTypeChecker
         write_security_daily(sec_name, security_close_df)
+        millis = log_millis(millis, "daily: ")
 
-    if DO_INTRADAY and (sec_name in INTRADAY_COMDTYS):
-        write_security_intraday(sec_name, wap_dfs_list)
+
+def _convert_to_mins(ts):
+    return (ts.hour * 60) + ts.minute
+
+
+# noinspection PyUnresolvedReferences,PyTypeChecker
+def write_all_intraday_data(sec_name, contracts_info):
+    millis = current_millis()
+
+    contract_waps_df_list = list()
+    for contract_name, (start_p, end_p, __, __) in contracts_info.iteritems():
+        # Manipulations to get minute-granularity period range perfectly covering the [start-end) time span
+        index = pandas.period_range(start=(start_p.asfreq('D')-1), end=end_p, freq='min')[1:]
+        start_dt = index[0].to_timestamp().to_datetime()
+        end_dt = index[-1].to_timestamp().to_datetime()
+
+        contract_waps_df = icontract.factory(contract_name).get_vwap_data_df(index, columns=['value', 'volume'], skip_align=True)
+        if (contract_waps_df is None) or (len(contract_waps_df) <= 0):
+            continue
+        contract_waps_df = contract_waps_df[~numpy.isnan(contract_waps_df.value)]
+        if (contract_waps_df is None) or (len(contract_waps_df) <= 0):
+            continue
+
+        contract_waps_df['contract'] = contract_name
+        contract_waps_df_list.append(contract_waps_df)
+
+    all_vwaps_df = pandas.concat(contract_waps_df_list)
+    all_vwaps_df.index.name = 'date'
+    millis = log_millis(millis, "Time to read %s rows of VWAP data: " % len(all_vwaps_df))
+    all_vwaps_df = all_vwaps_df.reset_index()
+    millis = log_millis(millis, "reset_index: ")
+    # Add columns for the number of minutes into each day, and the date with no time component
+    all_vwaps_df.loc[:, 'mins'] = [_convert_to_mins(p) for p in all_vwaps_df.date]
+    millis = log_millis(millis, "mins: ")
+    all_vwaps_df.loc[:, 'log_s'] = [datetime.date(ts.year, ts.month, ts.day) for ts in all_vwaps_df.date]
+    millis = log_millis(millis, "log_s: ")
+    for mins in INTRADAY_MIN_SPECS:
+        grp_name = group_name(mins)
+        all_vwaps_df.loc[:, grp_name] = all_vwaps_df.mins // mins
+    millis = log_millis(millis, 'min groups: ')
+    all_vwaps_df.drop('date', axis=1, inplace=True)
+    millis = log_millis(millis, "drop: ")
+
+    all_vwaps_df['numer'] = all_vwaps_df.value * all_vwaps_df.volume
+
+    for mins in INTRADAY_MIN_SPECS:
+        grouped = all_vwaps_df.groupby([group_name(mins), 'contract', 'log_s'])
+        mins_wap_df = grouped.agg(OrderedDict([('value', numpy.mean), ('numer', numpy.sum), ('volume', numpy.sum)]))
+        mins_wap_df.columns = ['twap', 'vwap', 'volume']
+        mins_wap_df.vwap = mins_wap_df.vwap / mins_wap_df.volume
+        write_mins_wap_df(sec_name, mins, mins_wap_df)
+
+    millis = log_millis(millis, "agg calcs")
 
 
 def get_close_prices(contract_name, start, end):
@@ -280,60 +313,6 @@ def get_close_prices(contract_name, start, end):
     return None
 
 
-def create_wap_dfs_list(mins_specs):
-    waps_dfs_list = list()
-    for mins in mins_specs:
-        if (MINS_IN_DAY % mins) <> 0:
-            raise ValueError("Grouping by %s minutes does not fit evenly into a day" % mins)
-        num_groups = (MINS_IN_DAY // mins)
-        wap_dfs = [list() for i in range(num_groups)]
-        waps_dfs_list.append(wap_dfs)
-
-    return waps_dfs_list
-
-
-def get_intraday_prices(security_all_vwaps_df, contract_name, start, end, wap_dfs_list):
-    def _convert_to_mins(p):
-        tup = p.timetuple()
-        return (tup.tm_hour * 60) + tup.tm_min
-
-    # Manipulations to get minute-granularity period range perfectly covering the [start-end) time span
-    start = start.to_timestamp().to_datetime()
-    end = end.to_timestamp().to_datetime()
-
-    try:
-        min_waps_df = security_all_vwaps_df.loc[contract_name][start:end].reset_index()
-    except KeyError as exc:
-        min_waps_df = None
-
-    if (min_waps_df is None) or (len(min_waps_df) <= 0):
-        return None
-
-    # Iterate over the different minute specifications requested
-    for wap_dfs in wap_dfs_list:
-        # Infer the minutes per bucket from the list
-        mins = int(MINS_IN_DAY / len(wap_dfs))
-        grp_name = group_name(mins)
-
-        # Group by the groups
-        grouping = min_waps_df.loc[:, ('log_s', 'value', 'volume', grp_name)].groupby(grp_name)
-        for grp, grp_df in grouping:
-            dates = []
-            wap_rows = []
-            for dt, dt_df in grp_df.groupby('log_s'):
-                vwap = stats.wmean(dt_df.value, dt_df.volume)
-                twap = dt_df.value.mean()
-                vol = dt_df.volume.sum()
-                if vol >= 0.0:
-                    vol = int(vol)
-                if not (numpy.isnan(vwap) and numpy.isnan(twap) and numpy.isnan(vol)):
-                    dates.append(dt)
-                    wap_rows.append([contract_name, vwap, twap, vol])
-            tmp_df = pandas.DataFrame(wap_rows, columns=['contract', 'vwap', 'twap', 'volume'], index=dates)
-            tmp_df.index.name = 'log_s'
-            wap_dfs[grp].append(tmp_df)
-
-
 def write_security_daily(sec_name, df):
     storage = price.PriceDataStorage('close', sec_name)
     for name, series in df.close.groupby(df['contract']):
@@ -346,19 +325,9 @@ def write_security_daily(sec_name, df):
     write_blob(sec_name, 'DAILY', 'close', df_dict)
 
 
-def write_security_intraday(sec_name, wap_dfs_list):
-    for wap_dfs in wap_dfs_list:
-        # Infer the minutes per bucket from the list
-        mins = int(MINS_IN_DAY / len(wap_dfs))
-        for min_group, min_wap_dfs in enumerate(wap_dfs):
-            if len(min_wap_dfs) > 0:
-                wap_df = pandas.concat(min_wap_dfs)
-                write_wap_df(sec_name, "INTRADAY", mins, min_group, wap_df)
-
-
-def write_wap_df(sec_name, category, min_spec, min_group, wap_df):
-    if (wap_df is None) or (len(wap_df) <= 0):
-        print("Empty wap_df for %s/%s/%s" % (sec_name, min_spec, min_group))
+def write_mins_wap_df(sec_name, mins, mins_wap_df):
+    if (mins_wap_df is None) or (len(mins_wap_df) <= 0):
+        print("Empty wap_df for %s/%s" % (sec_name, mins))
         return
 
     def maybe_tuple(foo):
@@ -368,31 +337,27 @@ def write_wap_df(sec_name, category, min_spec, min_group, wap_df):
         else:
             return None
 
-    orig_df = wap_df
+    mins_wap_df = mins_wap_df.reset_index().set_index('log_s')
+    # print(mins_wap_df)
 
-    wap_df = orig_df.copy().loc[:, ('contract', 'vwap', 'volume')]
-    storage = price.PriceDataStorage(price.PriceData.VWAP, sec_name)
-    for name, df in wap_df.groupby('contract'):
-        first_date = df.index[0].to_datetime().date()
-        cindex = pandas.date_range(df.index[0], df.index[-1], freq='D')
-        values = df.reindex(cindex).values
-        values2 = tuple(maybe_tuple(None if numpy.isnan(f) else f for f in row[1:]) for row in values)
-        storage.add(name, first_date, values2, ('vwap', 'volume'))
-    df_dict = storage.to_dict()
-    full_category = "%s/%s/%s" % (category, min_spec, min_group)
-    write_blob(sec_name, full_category, "vwap", df_dict)
+    for grp, grp_df in mins_wap_df.groupby(group_name(mins)):
+        v_storage = price.PriceDataStorage(price.PriceData.VWAP, sec_name)
+        t_storage = price.PriceDataStorage(price.PriceData.TWAP, sec_name)
 
-    wap_df = orig_df.loc[:, ('contract', 'twap')]
-    storage = price.PriceDataStorage(price.PriceData.TWAP, sec_name)
-    for name, df in wap_df.groupby('contract'):
-        first_date = df.index[0].to_datetime().date()
-        cindex = pandas.date_range(df.index[0], df.index[-1], freq='D')
-        values = df.reindex(cindex).values
-        values2 = tuple(None if numpy.isnan(row[1]) else row[1] for row in values)
-        storage.add(name, first_date, values2, ('twap',))
-    df_dict = storage.to_dict()
-    full_category = "%s/%s/%s" % (category, min_spec, min_group)
-    write_blob(sec_name, full_category, "twap", df_dict)
+        for contract_name, contract_df in grp_df.groupby('contract'):
+            first_date = contract_df.index[0]
+            last_date = contract_df.index[-1]
+            cindex = pandas.date_range(first_date, last_date, freq='D')
+            values = contract_df.reindex(cindex).values
+            # rows in values look like [grp, contract_name, twap, vwap, volume]
+            v_values = tuple(maybe_tuple(None if numpy.isnan(f) else f for f in row[3:]) for row in values)
+            t_values = tuple(None if numpy.isnan(row[2]) else row[2] for row in values)
+            v_storage.add(contract_name, first_date, v_values, ('vwap', 'volume'))
+            t_storage.add(contract_name, first_date, t_values, ('twap',))
+
+        full_category = "%s/%s/%s" % ('INTRADAY', mins, grp)
+        write_blob(sec_name, full_category, "vwap", v_storage.to_dict())
+        write_blob(sec_name, full_category, "twap", t_storage.to_dict())
 
 
 def write_blob(sec_name, category, blob_name, data, do_write=DO_WRITES):
@@ -402,7 +367,7 @@ def write_blob(sec_name, category, blob_name, data, do_write=DO_WRITES):
         mstr = msgpack.packb(data, use_bin_type=True)
         BUCKET.put_object(Key=path, Body=mstr)
     else:
-        print("Skipping blob write")
+        print("Skipping %s" % path)
 
 
 def read_blob(sec_name, contract_name, category, blob_name):
