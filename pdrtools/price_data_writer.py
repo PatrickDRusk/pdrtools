@@ -16,6 +16,7 @@ import numpy
 import pandas
 from pandas.tseries import offsets
 
+import fimc
 from instrumentz import contract as icontract
 from instrumentz import security as isecurity
 from instrumentz import series as iseries
@@ -27,13 +28,12 @@ current_millis = lambda: int(round(time.time() * 1000))
 
 BUCKET = None
 
+DEFAULT_BUCKET = 'cm-engineers'
+DEFAULT_PREFIX = 'pdr/blobz'
+
 DEFAULT_BDAYS_PER_CONTRACT = 290
 DEFAULT_CORRECTION_DAYS = 35
 DEFAULT_INTRADAY_GRANULARITIES = (15, 120, )
-CURRENT_THROUGH = '2017-06-05'
-
-DEFAULT_BUCKET = 'cm-engineers'
-DEFAULT_PREFIX = 'pdr/blobz'
 
 DO_WRITES = False
 DO_DAILY = False
@@ -83,40 +83,6 @@ COMDTYS = (
     "XB_COMDTY",
 )
 
-FULL_COMDTYS = (
-    "AA_COMDTY",
-    "CL_COMDTY",
-    "CO_COMDTY",
-    "CU_COMDTY",
-    "HG_COMDTY",
-    "LA_COMDTY",
-    "LC_COMDTY",
-    "LH_COMDTY",
-    "LL_COMDTY",
-    "LN_COMDTY",
-    "LP_COMDTY",
-    "LX_COMDTY",
-
-    "BO_COMDTY",
-    "BZA_COMDTY",
-    "CC_COMDTY",
-    "CT_COMDTY",
-    "EN_COMDTY",
-    "ES_INDEX",
-    "GC_COMDTY",
-    "HO_COMDTY",
-    "KC_COMDTY",
-    "NG_COMDTY",
-    "PL_COMDTY",
-    "QS_COMDTY",
-    "SB_COMDTY",
-    "SM_COMDTY",
-    "S_COMDTY",
-    "TY_COMDTY",
-    "W_COMDTY",
-    "XB_COMDTY",
-)
-
 BAD_CONTRACTS = {
     "AAX99_COMDTY",
     "AAZ99_COMDTY",
@@ -131,9 +97,7 @@ BAD_CONTRACTS = {
     "AAQ00_COMDTY",
 }
 
-INTRADAY_COMDTYS = {'CL_COMDTY', 'CO_COMDTY', 'EN_COMDTY', 'XB_COMDTY', 'HO_COMDTY', 'HG_COMDTY', 'SB_COMDTY'}
-
-METADATA = price.Metadata()
+METADATA = None  # type: price.Metadata
 
 
 def __main():
@@ -146,13 +110,17 @@ def __main():
 
     load_metadata()
 
-    for sec_name in COMDTYS:
-        process_symbol(sec_name)
-        save_metadata()
+    process_all_symbols(BACKTEST_END)
 
     save_metadata(do_write=True)
 
     log_millis(millis, "Time to run: ")
+
+
+def log_millis(millis, pattern):
+    delta = current_millis() - millis
+    print(pattern + str(delta))
+    return current_millis()
 
 
 def load_metadata():
@@ -173,21 +141,35 @@ def load_metadata():
         METADATA.correction_days(None, DEFAULT_CORRECTION_DAYS)
 
 
-def log_millis(millis, pattern):
-    delta = current_millis() - millis
-    print(pattern + str(delta))
-    return current_millis()
-
-
 def save_metadata(do_write=DO_WRITES):
     write_blob(None, None, 'metadata', METADATA, do_write=do_write)
+
+
+def process_all_symbols(through_date):
+    fimc_provider = fimc.get_provider()
+    all_secs = fimc_provider.securities
+    all_futures = sorted([security for security in all_secs
+                          if fimc_provider.metadata(security)['security_type'].startswith('Future')])
+
+    for sec_name in all_futures:
+        process_symbol(sec_name, through_date)
+        save_metadata()
 
 
 def group_name(mins):
     return 'grp_%d' % mins
 
 
-def process_symbol(sec_name):
+def process_symbol(sec_name, through_date):
+    if METADATA.blacklist(sec_name):
+        print("Skipping %s because it is blacklisted" % sec_name)
+        return
+
+    current_through = METADATA.current_through(sec_name)
+    if current_through and (current_through >= through_date):
+        print("Skipping %s because it is already current through %s" % (sec_name, current_through))
+        return
+
     print("Processing %s" % sec_name)
     millis = current_millis()
     instrument = isecurity.factory(sec_name)
@@ -213,10 +195,6 @@ def process_symbol(sec_name):
     else:
         df.loc[:, 'inception'] = None
 
-    METADATA.current_through(sec_name, CURRENT_THROUGH)
-    if (sec_name in INTRADAY_COMDTYS) and (METADATA.intraday(sec_name) is None):
-        METADATA.intraday(sec_name, True)
-
     # Gather start/end stats for all relevant contracts
     contracts_info = OrderedDict()
     for contract_name in df.index:
@@ -234,14 +212,14 @@ def process_symbol(sec_name):
         # NOTE: Use inception - 1 BDay if wanting to store all contract data in the future.
         # inception = df.loc[contract_name, 'inception']
         # For now, we're just storing the last BDAYS_PER_CONTRACT business days of prices.
-        start_p = max(indaux.apply_offset(expiry, -DEFAULT_BDAYS_PER_CONTRACT * offsets.BDay()), DEEP_PAST)
+        start_p = max(DEEP_PAST, indaux.apply_offset(expiry, -METADATA.bdays_per_contract(sec_name) * offsets.BDay()))
 
         # Convert to naive datetimes (for efficient use elsewhere)
         start_dt = start_p.to_timestamp().to_datetime()
         end_dt = end_p.to_timestamp().to_datetime()
         contracts_info[contract_name] = (start_p, end_p, start_dt, end_dt)
 
-    if DO_INTRADAY and (sec_name in INTRADAY_COMDTYS):
+    if DO_INTRADAY and check_intraday(sec_name):
         write_all_intraday_data(sec_name, contracts_info)
 
     # This will hold multiple contracts' close prices, to be concatenated later
@@ -259,7 +237,26 @@ def process_symbol(sec_name):
         # noinspection PyTypeChecker
         write_security_daily(sec_name, security_close_df)
 
+    # Only indicate that we are "current" if neither daily or intraday were shut off
+    if DO_DAILY and DO_INTRADAY:
+        METADATA.current_through(sec_name, through_date)
+
     log_millis(millis, "Total time: ")
+
+
+def check_intraday(sec_name):
+    if METADATA.intraday_blacklist(sec_name):
+        print("Skipping intraday for %s because it is blacklisted" % sec_name)
+        return False
+
+    intraday = METADATA.intraday(sec_name)
+    if intraday is None:
+        # It has never been checked or explicitly negated, so check..
+        # TODO Replace with a inquiry to instrumentz or fimc
+        INTRADAY_COMDTYS = {'CL_COMDTY', 'CO_COMDTY', 'EN_COMDTY', 'XB_COMDTY', 'HO_COMDTY', 'HG_COMDTY', 'SB_COMDTY'}
+        return (sec_name in INTRADAY_COMDTYS)
+    else:
+        return intraday
 
 
 # noinspection PyUnresolvedReferences,PyTypeChecker
@@ -288,20 +285,23 @@ def write_all_intraday_data(sec_name, contracts_info):
     posix_seconds = posix % SECONDS_IN_DAY
     posix_dates = posix - posix_seconds
     posix_mins = posix_seconds // 60
-    for mins in DEFAULT_INTRADAY_GRANULARITIES:
+    for mins in METADATA.intraday_granularities(sec_name):
         grp_name = group_name(mins)
         all_vwaps_df.loc[:, grp_name] = posix_mins // mins
     all_vwaps_df.loc[:, 'log_s'] = posix_dates
 
     all_vwaps_df['numer'] = all_vwaps_df.value * all_vwaps_df.volume
 
-    for mins in DEFAULT_INTRADAY_GRANULARITIES:
+    for mins in METADATA.intraday_granularities(sec_name):
         grouped = all_vwaps_df.groupby([group_name(mins), 'contract', 'log_s'])
         mins_wap_df = grouped.agg(OrderedDict([('value', numpy.mean), ('numer', numpy.sum), ('volume', numpy.sum)]))
         mins_wap_df.columns = ['twap', 'vwap', 'volume']
         mins_wap_df.vwap = mins_wap_df.vwap / mins_wap_df.volume
         mins_wap_df.volume = mins_wap_df.volume[~numpy.isnan(mins_wap_df.volume)].astype(int)
         write_mins_wap_df(sec_name, mins, mins_wap_df)
+
+    # Note the presence of intraday data in the metadata
+    METADATA.intraday(sec_name, True)
 
     log_millis(millis, "Time to pricess and write intraday: ")
 
