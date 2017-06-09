@@ -26,17 +26,22 @@ from price_data import storage as price
 current_millis = lambda: int(round(time.time() * 1000))
 
 BUCKET = None
-PREFIX = 'pdr/blobz'
 
-BDAYS_PER_CONTRACT = 150
+DEFAULT_BDAYS_PER_CONTRACT = 290
+DEFAULT_CORRECTION_DAYS = 35
+DEFAULT_INTRADAY_GRANULARITIES = (15, 120, )
+CURRENT_THROUGH = '2017-06-05'
 
-DO_WRITES = True
-DO_DAILY = True
-DO_INTRADAY = True
+DEFAULT_BUCKET = 'cm-engineers'
+DEFAULT_PREFIX = 'pdr/blobz'
+
+DO_WRITES = False
+DO_DAILY = False
+DO_INTRADAY = False
 
 SHORT_TEST = False
 
-BACKTEST_START = '2017-03-02' if SHORT_TEST else '1990-01-06'
+BACKTEST_START = '2017-03-02' if SHORT_TEST else '1990-01-03'
 BACKTEST_END = str(datetime.date.today())
 BACKTEST_INDEX = pandas.period_range(start=BACKTEST_START, end=BACKTEST_END, freq='B')
 DEEP_PAST = BACKTEST_INDEX[0]
@@ -126,38 +131,56 @@ BAD_CONTRACTS = {
     "AAQ00_COMDTY",
 }
 
-INTRADAY_COMDTYS = {'CL_COMDTY', 'CO_COMDTY', 'XB_COMDTY', 'HO_COMDTY', 'HG_COMDTY', 'SB_COMDTY'}
-INTRADAY_MIN_SPECS = (15, 120)
+INTRADAY_COMDTYS = {'CL_COMDTY', 'CO_COMDTY', 'EN_COMDTY', 'XB_COMDTY', 'HO_COMDTY', 'HG_COMDTY', 'SB_COMDTY'}
 
-CONTRACT_MAP = dict()
+METADATA = price.Metadata()
 
 
 def __main():
     millis = current_millis()
 
-    global BUCKET, CONTRACT_MAP
-    s3 = boto3.resource('s3')
-    BUCKET = s3.Bucket('cm-engineers')
+    global BUCKET
+    BUCKET = boto3.resource('s3').Bucket(DEFAULT_BUCKET)
+    print(DEFAULT_BUCKET)
+    print(DEFAULT_PREFIX)
 
-    # noinspection PyBroadException
-    try:
-        # Initialize contract map with what we've seen before
-        CONTRACT_MAP = read_blob(None, None, None, 'contract_map')
-    except:
-        CONTRACT_MAP = dict()
+    load_metadata()
 
     for sec_name in COMDTYS:
         process_symbol(sec_name)
+        save_metadata()
 
-    write_blob(None, None, 'contract_map', CONTRACT_MAP)
+    save_metadata(do_write=True)
 
     log_millis(millis, "Time to run: ")
+
+
+def load_metadata():
+    global METADATA
+    # noinspection PyBroadException
+    try:
+        # Initialize contract map with what we've seen before
+        METADATA = price.Metadata(read_blob(None, None, None, 'metadata'))
+    except Exception:
+        METADATA = price.Metadata()
+
+    # Fill in some defaults, if missing
+    if METADATA.intraday_granularities(None) is None:
+        METADATA.intraday_granularities(None, DEFAULT_INTRADAY_GRANULARITIES)
+    if METADATA.bdays_per_contract(None) is None:
+        METADATA.bdays_per_contract(None, DEFAULT_BDAYS_PER_CONTRACT)
+    if METADATA.correction_days(None) is None:
+        METADATA.correction_days(None, DEFAULT_CORRECTION_DAYS)
 
 
 def log_millis(millis, pattern):
     delta = current_millis() - millis
     print(pattern + str(delta))
     return current_millis()
+
+
+def save_metadata(do_write=DO_WRITES):
+    write_blob(None, None, 'metadata', METADATA, do_write=do_write)
 
 
 def group_name(mins):
@@ -190,13 +213,17 @@ def process_symbol(sec_name):
     else:
         df.loc[:, 'inception'] = None
 
+    METADATA.current_through(sec_name, CURRENT_THROUGH)
+    if (sec_name in INTRADAY_COMDTYS) and (METADATA.intraday(sec_name) is None):
+        METADATA.intraday(sec_name, True)
+
     # Gather start/end stats for all relevant contracts
     contracts_info = OrderedDict()
     for contract_name in df.index:
         if contract_name in BAD_CONTRACTS:
             continue
 
-        CONTRACT_MAP[contract_name] = sec_name
+        METADATA.contract_map[contract_name] = sec_name
 
         expiry = df.loc[contract_name, 'expiration']
 
@@ -207,7 +234,7 @@ def process_symbol(sec_name):
         # NOTE: Use inception - 1 BDay if wanting to store all contract data in the future.
         # inception = df.loc[contract_name, 'inception']
         # For now, we're just storing the last BDAYS_PER_CONTRACT business days of prices.
-        start_p = max(indaux.apply_offset(expiry, -BDAYS_PER_CONTRACT * offsets.BDay()), DEEP_PAST)
+        start_p = max(indaux.apply_offset(expiry, -DEFAULT_BDAYS_PER_CONTRACT * offsets.BDay()), DEEP_PAST)
 
         # Convert to naive datetimes (for efficient use elsewhere)
         start_dt = start_p.to_timestamp().to_datetime()
@@ -261,14 +288,14 @@ def write_all_intraday_data(sec_name, contracts_info):
     posix_seconds = posix % SECONDS_IN_DAY
     posix_dates = posix - posix_seconds
     posix_mins = posix_seconds // 60
-    for mins in INTRADAY_MIN_SPECS:
+    for mins in DEFAULT_INTRADAY_GRANULARITIES:
         grp_name = group_name(mins)
         all_vwaps_df.loc[:, grp_name] = posix_mins // mins
     all_vwaps_df.loc[:, 'log_s'] = posix_dates
 
     all_vwaps_df['numer'] = all_vwaps_df.value * all_vwaps_df.volume
 
-    for mins in INTRADAY_MIN_SPECS:
+    for mins in DEFAULT_INTRADAY_GRANULARITIES:
         grouped = all_vwaps_df.groupby([group_name(mins), 'contract', 'log_s'])
         mins_wap_df = grouped.agg(OrderedDict([('value', numpy.mean), ('numer', numpy.sum), ('volume', numpy.sum)]))
         mins_wap_df.columns = ['twap', 'vwap', 'volume']
@@ -306,7 +333,7 @@ def write_security_daily(sec_name, df):
         first_date = series.index[0].to_timestamp().to_datetime().date()
         cindex = pandas.period_range(series.index[0], series.index[-1], freq='D')
         values = series.asfreq('D').reindex(cindex).values.tolist()
-        values = [None if numpy.isnan(f) else f for f in values]
+        values = (tuple(None if numpy.isnan(f) else f for f in values), )
         storage.add(name, first_date, values, ('close',))
     df_dict = storage.to_dict()
     print("close")
@@ -318,19 +345,12 @@ def write_mins_wap_df(sec_name, mins, mins_wap_df):
         print("Empty wap_df for %s/%s" % (sec_name, mins))
         return
 
-    def maybe_tuple(foo):
-        t = tuple(foo)
-        if any(t):
-            return t
-        else:
-            return None
-
     print("%d min waps" % mins, sep='', end='')
     mins_wap_df = mins_wap_df.reset_index().set_index('log_s')
 
     for grp, grp_df in mins_wap_df.groupby(group_name(mins)):
-        v_storage = price.PriceDataStorage(price.PriceData.VWAP, sec_name, minutes=mins, start_minutes=grp*mins)
-        t_storage = price.PriceDataStorage(price.PriceData.TWAP, sec_name, minutes=mins, start_minutes=grp*mins)
+        v_storage = price.PriceDataStorage(price.PriceData.VWAP, sec_name, start=grp*mins, duration=mins)
+        t_storage = price.PriceDataStorage(price.PriceData.TWAP, sec_name, start=grp*mins, duration=mins)
 
         for contract_name, contract_df in grp_df.groupby('contract'):
             first_posix_date = contract_df.index[0]
@@ -341,8 +361,9 @@ def write_mins_wap_df(sec_name, mins, mins_wap_df):
                 contract_df = contract_df.reindex(new_index)
             values = contract_df.values
             # rows in values look like [grp, contract_name, twap, vwap, volume]
-            v_values = tuple(maybe_tuple(None if numpy.isnan(f) else f for f in row[3:]) for row in values)
-            t_values = tuple(None if numpy.isnan(row[2]) else row[2] for row in values)
+            v_values = (tuple(None if numpy.isnan(row[3]) else row[3] for row in values),
+                        tuple(None if numpy.isnan(row[4]) else row[4] for row in values))
+            t_values = (tuple(None if numpy.isnan(row[2]) else row[2] for row in values), )
 
             first_date = datetime.datetime.fromtimestamp(first_posix_date, pytz.UTC).date()
             v_storage.add(contract_name, first_date, v_values, ('vwap', 'volume'))
@@ -357,7 +378,7 @@ def write_mins_wap_df(sec_name, mins, mins_wap_df):
 
 
 def write_blob(sec_name, category, blob_name, data, do_write=DO_WRITES):
-    path = os.path.join(*filter(None, [PREFIX, sec_name, category, blob_name]))
+    path = os.path.join(*filter(None, [DEFAULT_PREFIX, sec_name, category, blob_name]))
     if do_write:
         # print(path)
         mstr = msgpack.packb(data, use_bin_type=True)
@@ -368,7 +389,7 @@ def write_blob(sec_name, category, blob_name, data, do_write=DO_WRITES):
 
 
 def read_blob(sec_name, contract_name, category, blob_name):
-    path = os.path.join(*filter(None, [PREFIX, sec_name, category, contract_name, blob_name]))
+    path = os.path.join(*filter(None, [DEFAULT_PREFIX, sec_name, category, contract_name, blob_name]))
     # print("Reading: ", path)
     mstr = BUCKET.Object(path).get().get('Body').read()
     return msgpack.unpackb(mstr, use_list=False)
