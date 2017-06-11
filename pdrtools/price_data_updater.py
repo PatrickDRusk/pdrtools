@@ -310,6 +310,7 @@ def process_symbol(sec_name, through_date):
         # Discard contracts that expire before the beginning of the period
         end_p = indaux.apply_offset(expiry, offsets.BDay())
         if end_p < threshold_p:
+            # print("Skipping %s for ending %s, before threshold %s" % (contract_name, end_p, threshold_p))
             continue
 
         # NOTE: Use inception - 1 BDay if wanting to store all contract data in the future.
@@ -369,6 +370,7 @@ def write_intraday_data(sec_name, contracts_info, do_update):
 
     contract_waps_df_list = list()
     for contract_name, (start_p, end_p, __, __) in contracts_info.iteritems():
+        # print("Reading contract %s" % contract_name)
         # Manipulations to get minute-granularity period range perfectly covering the [start-end) time span
         index = pandas.period_range(start=(start_p.asfreq('D')-1), end=end_p, freq='min')[1:]
 
@@ -471,7 +473,9 @@ def write_mins_wap_df(sec_name, granularity, mins_wap_df, do_update):
             v_storage = price.PriceDataStorage(price.PriceData.VWAP, sec_name, start=grp * granularity, duration=granularity)
             t_storage = price.PriceDataStorage(price.PriceData.TWAP, sec_name, start=grp * granularity, duration=granularity)
 
+        grp_df = grp_df.copy()
         for contract_name, contract_df in grp_df.groupby('contract'):
+            contract_df = contract_df.copy()
             first_posix_date = contract_df.index[0]
             last_posix_date = contract_df.index[-1]
             if first_posix_date < last_posix_date:
