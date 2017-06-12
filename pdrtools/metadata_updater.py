@@ -8,7 +8,8 @@ Usage:
 
 The security can be None to get/set the global defaults.
 
-If value is specified, it will set the appropriate attribute.  In the absence, it gets the attribute(s).
+If value is specified, it will set the appropriate attribute.  If not specified, it prints the attribute(s).
+
 value is interpreted in the following ways:
   * if integral, as an integer
   * if either of the strings "True" or "False", as True or False
@@ -112,11 +113,6 @@ def do_work(security, key, value):
         sec = interpret_value(security)
         # noinspection PyProtectedMember
         METADATA._get_set_attr(key, sec, val)
-        # dict_ = METADATA if sec is None else METADATA['securities'][sec]
-        # if val is None:
-        #     del dict_[key]
-        # else:
-        #     dict_[key] = val
 
     elif key is not None:
         sec = interpret_value(security)
