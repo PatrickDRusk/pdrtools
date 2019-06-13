@@ -3,7 +3,7 @@
 """
 price_data_updater is a script to incrementally update the prices in the backtest price data store.
 
-The standard use is to call it with no options, which will update all the prices and metadata through 'yester-bday'.
+The standard use is to call it with no options, which will update all the prices and metadata through 'besterday'.
 
 Usage:
   price_data_updater.py [options]
@@ -15,7 +15,7 @@ Options:
   --symbols SYMBOLS       A list of symbols to process, colon-separated, defaulting to all
 
   --start-date DATE       Sets the earliest date for price data [default: 1990-01-03]
-  --end-date DATE         Sets the latest date for price data, defaulting to 'yester-bday'
+  --end-date DATE         Sets the latest date for price data, defaulting to 'besterday'
 
   --contract-bdays BDAYS  The default number of business days per contract [default: 290]
   --correction-days DAYS  The default number of days of lookback for corrections [default: 35]
@@ -37,7 +37,6 @@ from __future__ import print_function
 import datetime
 import os
 import pytz
-import sys
 import time
 from collections import OrderedDict
 
@@ -96,65 +95,6 @@ BACKTEST_INDEX = None  # type: pandas.PeriodIndex
 
 # An optional list of commodities to restrict processing to
 SYMBOLS = None  # type: tuple
-
-# The list that was used historically
-# TODO Eventually remove this.  It is documentary only.
-ORIG_SYMBOLS = (
-    "AA_COMDTY",
-    "CL_COMDTY",
-    "CO_COMDTY",
-    "CU_COMDTY",
-    "HG_COMDTY",
-    "LA_COMDTY",
-    "LC_COMDTY",
-    "LH_COMDTY",
-    "LL_COMDTY",
-    "LN_COMDTY",
-    "LP_COMDTY",
-    "LX_COMDTY",
-
-    "BO_COMDTY",
-    "BZA_COMDTY",
-    "CC_COMDTY",
-    "CT_COMDTY",
-    "EN_COMDTY",
-    "ES_INDEX",
-    "GC_COMDTY",
-    "HO_COMDTY",
-    "KC_COMDTY",
-    "NG_COMDTY",
-    "PL_COMDTY",
-    "QS_COMDTY",
-    "SB_COMDTY",
-    "SM_COMDTY",
-    "S_COMDTY",
-    "TY_COMDTY",
-    "W_COMDTY",
-    "XB_COMDTY",
-)
-
-# TODO Also documentary and eventually to be removed
-OTHER_SYMBOLS = "A5_INDEX:AD_CURNCY:AI_INDEX:AJ_INDEX:ATT_INDEX:AX_INDEX:BC_INDEX:BE_INDEX:" \
-              "BP_CURNCY:BZ_INDEX:CD_CURNCY:CF_INDEX:CN_COMDTY:" \
-              "C_COMDTY:DU_COMDTY:DW_COMDTY:DX_CURNCY:EC_CURNCY:EO_INDEX:FN_COMDTY:" \
-              "FT_INDEX:FV_COMDTY:GI_INDEX:GX_INDEX:HU_COMDTY:HU_INDEX:IB_COMDTY:" \
-              "IB_INDEX:IH_INDEX:IJ_COMDTY:IS_INDEX:JB_COMDTY:JO_COMDTY:JY_CURNCY:KAA_COMDTY:KM_INDEX:" \
-              "KO_COMDTY:KRS_INDEX:LT_COMDTY:LW_COMDTY:" \
-              "NH_INDEX:NQ_INDEX:NX_COMDTY:NX_INDEX:OI_INDEX:OQA_COMDTY:OT_INDEX:PE_CURNCY:" \
-              "PP_INDEX:PT_INDEX:QC_INDEX:QW_COMDTY:QZ_INDEX:SF_COMDTY:SF_CURNCY:" \
-              "SI_COMDTY:SM_INDEX:SP_INDEX:ST_INDEX:TA_INDEX:TP_INDEX:TU_COMDTY:TW_INDEX:" \
-              "UO_INDEX:US_COMDTY:UX_INDEX:VE_INDEX:VG_INDEX:XP_INDEX:XU_INDEX:XW_COMDTY:Z_INDEX"
-ALL_SYMBOLS = "A5_INDEX:AA_COMDTY:AD_CURNCY:AI_INDEX:AJ_INDEX:ATT_INDEX:AX_INDEX:BC_INDEX:BE_INDEX:BO_COMDTY:" \
-              "BP_CURNCY:BZA_COMDTY:BZ_INDEX:CC_COMDTY:CD_CURNCY:CF_INDEX:CL_COMDTY:CN_COMDTY:CO_COMDTY:CT_COMDTY:" \
-              "CU_COMDTY:C_COMDTY:DU_COMDTY:DW_COMDTY:DX_CURNCY:EC_CURNCY:EN_COMDTY:EO_INDEX:ES_INDEX:FN_COMDTY:" \
-              "FT_INDEX:FV_COMDTY:GC_COMDTY:GI_INDEX:GX_INDEX:HG_COMDTY:HO_COMDTY:HU_COMDTY:HU_INDEX:IB_COMDTY:" \
-              "IB_INDEX:IH_INDEX:IJ_COMDTY:IS_INDEX:JB_COMDTY:JO_COMDTY:JY_CURNCY:KAA_COMDTY:KC_COMDTY:KM_INDEX:" \
-              "KO_COMDTY:KRS_INDEX:LA_COMDTY:LC_COMDTY:LH_COMDTY:LL_COMDTY:LN_COMDTY:LP_COMDTY:LT_COMDTY:LW_COMDTY:" \
-              "LX_COMDTY:NG_COMDTY:NH_INDEX:NQ_INDEX:NX_COMDTY:NX_INDEX:OI_INDEX:OQA_COMDTY:OT_INDEX:PE_CURNCY:" \
-              "PL_COMDTY:PP_INDEX:PT_INDEX:QC_INDEX:QS_COMDTY:QW_COMDTY:QZ_INDEX:SB_COMDTY:SF_COMDTY:SF_CURNCY:" \
-              "SI_COMDTY:SM_COMDTY:SM_INDEX:SP_INDEX:ST_INDEX:S_COMDTY:TA_INDEX:TP_INDEX:TU_COMDTY:TW_INDEX:" \
-              "TY_COMDTY:UO_INDEX:US_COMDTY:UX_INDEX:VE_INDEX:VG_INDEX:W_COMDTY:XB_COMDTY:XP_INDEX:XU_INDEX:" \
-              "XW_COMDTY:Z_INDEX"
 
 
 def __main():
