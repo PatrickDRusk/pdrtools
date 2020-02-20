@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 
 """
-msgunpack
+msgunpacker
 
 Reads an S3 blob, runs msgunpack on it, and prints the result.
 
 Usage:
-    msgunpack.py [options] <target>...
-    msgunpack.py (-h | --help)
+    msgunpacker.py [options] <target>...
+    msgunpacker.py (-h | --help)
 
 Options:
     --bucket BUCKET             The S3 bucket [default: cm-engineers]
@@ -16,7 +16,7 @@ Options:
     -h --help                   Display this message
 
 Example:
-    msgunpack.py --bucket cm-engineers --prefix pdr/blobz AA_COMDTY/DAILY/close
+    msgunpacker.py --bucket cm-engineers --prefix pdr/blobz AA_COMDTY/DAILY/close
 """
 
 from __future__ import absolute_import
@@ -48,7 +48,7 @@ def print_blob(s3_bucket, prefix, target):
     path = os.path.join(*filter(None, [prefix, target]))
     mstr = s3_bucket.Object(path).get().get('Body').read()
     data = msgpack.unpackb(mstr, use_list=False)
-    print(data)
+    print(data, end='')
 
 
 if __name__ == '__main__':
